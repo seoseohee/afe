@@ -109,19 +109,22 @@ class BoardConnection:
             return ExecResult(ok=False, stdout="", stderr=str(e), rc=-1)
 
     def upload_and_run(self, script: str, interpreter: str = "bash", timeout: int = 60) -> ExecResult:
+        """스크립트를 base64 인코딩해 원격에 직접 쓰고 실행한다. scp 불필요."""
+        import base64 as _b64
         ts = int(time.time() * 1000)
         remote_path = f"/tmp/_ecc_{ts}"
-        upload_cmd = (
-            ["scp"] + self.SSH_OPTS
-            + ["-P", str(self.port), "/dev/stdin", f"{self.user}@{self.host}:{remote_path}"]
-        )
-        try:
-            subprocess.run(upload_cmd, input=script.encode(), capture_output=True, timeout=15)
-        except Exception as e:
-            return ExecResult(ok=False, stdout="", stderr=f"upload failed: {e}", rc=-1)
+
+        # base64로 인코딩 → heredoc 특수문자 문제 완전 회피
+        b64 = _b64.b64encode(script.encode("utf-8")).decode("ascii")
+        write_cmd = f"printf '%s' {b64} | base64 -d > {remote_path}"
+
+        r = self.run(write_cmd, timeout=15)
+        if not r.ok:
+            return ExecResult(ok=False, stdout="", stderr=f"script write failed: {r.stderr}", rc=-1)
+
         return self.run(
             f"{interpreter} {remote_path}; _rc=$?; rm -f {remote_path}; exit $_rc",
-            timeout=timeout
+            timeout=timeout,
         )
 
     def is_alive(self) -> bool:

@@ -11,6 +11,9 @@ Claude Code의 tool executor와의 차이:
 """
 
 import json
+import threading
+import uuid as _uuid_mod
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from .connection import BoardConnection, ExecResult
@@ -19,6 +22,31 @@ from .todo import TodoManager
 
 if TYPE_CHECKING:
     pass
+
+
+# ── 백그라운드 task 저장소 ─────────────────────────────────────────
+
+@dataclass
+class _BgTask:
+    task_id: str
+    cmd: str
+    result: "ExecResult | None" = field(default=None)
+    done: bool = False
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def set_result(self, r: "ExecResult") -> None:
+        with self._lock:
+            self.result = r
+            self.done = True
+
+    def wait(self, timeout: float) -> bool:
+        import time
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.done:
+                return True
+            time.sleep(0.2)
+        return self.done
 
 
 class ToolExecutor:
@@ -37,6 +65,7 @@ class ToolExecutor:
         self.todos = todos
         self.verbose = verbose
         self.is_finished = False
+        self._bg_tasks: dict[str, _BgTask] = {}   # task_id → _BgTask
 
     def execute(self, tool_name: str, tool_input: dict) -> str:
         """
@@ -44,17 +73,18 @@ class ToolExecutor:
         반환값은 LLM의 tool_result content가 된다.
         """
         dispatch = {
-            "bash":     self._bash,
-            "script":   self._script,
-            "read":     self._read,
-            "write":    self._write,
-            "glob":     self._glob,
-            "grep":     self._grep,
-            "probe":    self._probe,
-            "verify":   self._verify,
-            "todo":     self._todo,
-            "subagent": self._subagent,
-            "done":     self._done,
+            "bash":      self._bash,
+            "bash_wait": self._bash_wait,
+            "script":    self._script,
+            "read":      self._read,
+            "write":     self._write,
+            "glob":      self._glob,
+            "grep":      self._grep,
+            "probe":     self._probe,
+            "verify":    self._verify,
+            "todo":      self._todo,
+            "subagent":  self._subagent,
+            "done":      self._done,
         }
         handler = dispatch.get(tool_name)
         if not handler:
@@ -67,13 +97,57 @@ class ToolExecutor:
         cmd = inp["command"]
         timeout = inp.get("timeout", 30)
         desc = inp.get("description", "")
+        background = inp.get("background", False)
 
         _print_tool("bash", f"{cmd[:100]}", desc)
 
         if is_dangerous(cmd):
             return "[blocked] 위험한 명령으로 판단되어 실행을 거부했습니다."
 
+        if background:
+            task_id = _uuid_mod.uuid4().hex[:8]
+            task = _BgTask(task_id=task_id, cmd=cmd)
+            self._bg_tasks[task_id] = task
+
+            def _run():
+                r = self.conn.run(cmd, timeout=timeout)
+                task.set_result(r)
+
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            print(f"    ⏳ background task_id={task_id}", flush=True)
+            return (
+                f"[background] task_id={task_id}\n"
+                f"Command is running in background. "
+                f"Use bash_wait(task_id='{task_id}') to retrieve the result."
+            )
+
         result = self.conn.run(cmd, timeout=timeout)
+        _print_result(result)
+        return result.to_tool_result()
+
+    # ─── bash_wait ─────────────────────────────────────────────
+
+    def _bash_wait(self, inp: dict) -> str:
+        task_id = inp["task_id"]
+        wait_timeout = inp.get("timeout", 120)
+        desc = inp.get("description", "")
+
+        _print_tool("bash_wait", f"task_id={task_id}", desc)
+
+        task = self._bg_tasks.get(task_id)
+        if task is None:
+            return f"[error] task_id '{task_id}' not found. Valid IDs: {list(self._bg_tasks.keys())}"
+
+        finished = task.wait(timeout=wait_timeout)
+        if not finished:
+            return (
+                f"[timeout] task_id={task_id} is still running after {wait_timeout}s.\n"
+                "Call bash_wait again with a longer timeout, or continue other work."
+            )
+
+        result = task.result
+        del self._bg_tasks[task_id]   # 수집 후 정리
         _print_result(result)
         return result.to_tool_result()
 
@@ -257,11 +331,14 @@ class ToolExecutor:
     def _done(self, inp: dict) -> str:
         success = inp.get("success", False)
         summary = inp.get("summary", "")
+        evidence = inp.get("evidence", "")
         notes = inp.get("notes", "")
 
         icon = "✅" if success else "❌"
         print(f"\n{'═'*60}")
         print(f"  {icon}  {summary}")
+        if evidence:
+            print(f"  🔍 Evidence: {evidence}")
         if notes:
             print(f"  📝 {notes}")
         print(f"{'═'*60}")

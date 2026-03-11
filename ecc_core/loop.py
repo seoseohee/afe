@@ -12,6 +12,7 @@ ECC v5 — 연결부터 목표 달성까지 에이전트가 전부 담당.
 
 import os
 import anthropic
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .connection import BoardConnection, BoardDiscovery
 from .todo import TodoManager
@@ -77,8 +78,9 @@ def run_subagent(
     executor = ToolExecutor(conn, todos, verbose)
     messages: list[dict] = [{"role": "user", "content": goal}]
     max_turns = _env_int("ECC_SUBAGENT_TURNS", 40)
+    turn = 0
 
-    for _ in range(max_turns):
+    while True:
         resp = client.messages.create(
             model=_main_model(),
             max_tokens=4096,
@@ -120,10 +122,26 @@ def run_subagent(
         if resp.stop_reason == "end_turn" and not any(
             b.type == "tool_use" for b in resp.content
         ):
-            for b in resp.content:
-                if b.type == "text":
-                    return b.text
-            break
+            # report() 없이 멈춤 → 다시 밀어준다
+            messages.append({
+                "role": "user",
+                "content": (
+                    "[system] You stopped without calling report(). "
+                    "Complete the task and call report() with your findings."
+                )
+            })
+            continue
+
+        turn += 1
+        if turn >= max_turns:
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"[system] {turn} turns elapsed. "
+                    "Wrap up and call report() with what you have found so far."
+                )
+            })
+            max_turns += 20
 
     return "(subagent: no report)"
 
@@ -158,8 +176,12 @@ class AgentLoop:
 
         model = _main_model()
         max_tokens = _main_max_tokens()
-
-        for turn in range(max_turns):
+        # thinking이 켜지면 budget + 응답 공간 확보
+        if _thinking_enabled():
+            max_tokens = max(max_tokens, _thinking_budget() + 4096)
+        escalation = EscalationTracker()
+        turn = 0
+        while True:
 
             if should_compact(messages):
                 messages = compact(messages, goal, todos.format_for_llm(), self.client)
@@ -177,13 +199,31 @@ class AgentLoop:
             )
 
             try:
-                resp = self.client.messages.create(
-                    model=model,
-                    max_tokens=max_tokens,
+                # escalation 체크 — 이번 turn에 opus+thinking 써야 하는지
+                escalate, reason = escalation.should_escalate()
+                turn_model = "claude-opus-4-6" if escalate else model
+                turn_thinking = escalate or _thinking_enabled()
+                turn_max_tokens = max(max_tokens, _thinking_budget() + 4096) if turn_thinking else max_tokens
+
+                if escalate:
+                    print(f"\n  🔺 Escalate → opus+thinking ({reason})", flush=True)
+
+                create_kwargs = dict(
+                    model=turn_model,
+                    max_tokens=turn_max_tokens,
                     system=system_with_state,
                     tools=TOOL_DEFINITIONS,
                     messages=messages,
                 )
+                if turn_thinking:
+                    create_kwargs["thinking"] = {
+                        "type": "enabled",
+                        "budget_tokens": _thinking_budget(),
+                    }
+                resp = self.client.messages.create(**create_kwargs)
+
+                if escalate:
+                    escalation.reset_escalation()  # sonnet으로 복귀
             except anthropic.BadRequestError as e:
                 if "context" in str(e).lower():
                     messages = compact(messages, goal, todos.format_for_llm(), self.client)
@@ -193,30 +233,47 @@ class AgentLoop:
             messages.append({"role": "assistant", "content": resp.content})
 
             for block in resp.content:
-                if block.type == "text" and block.text.strip():
-                    if len(block.text) < 300 or self.verbose:
-                        print(f"\n  💬 {block.text.strip()}", flush=True)
+                if block.type == "thinking" and block.thinking.strip():
+                    _print_thinking(block.thinking)
+                elif block.type == "text" and block.text.strip():
+                    print(f"\n  💬 {block.text.strip()}", flush=True)
 
             has_tools = any(b.type == "tool_use" for b in resp.content)
             if resp.stop_reason == "end_turn" and not has_tools:
-                print("\n  ✓ 완료")
-                break
+                # done()을 호출하지 않고 멈춘 경우 → 다시 밀어준다
+                print("\n  ⚠️  done() 없이 멈춤. 계속 진행 요청...", flush=True)
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "[system] You stopped without calling done(). "
+                        "The goal is not complete until you explicitly call done(). "
+                        "Continue working toward the goal, or call done(success=false) "
+                        "if it is proven impossible."
+                    )
+                })
+                continue
 
             tool_results = []
-            for block in resp.content:
-                if block.type != "tool_use":
-                    continue
+            tool_blocks = [b for b in resp.content if b.type == "tool_use"]
 
+            # ssh_connect / subagent / no-conn 오류는 순서 의존 → 직렬 처리
+            # bash, script, read, write, glob, grep, probe, verify → 병렬 가능
+            PARALLEL_TOOLS = {"bash", "bash_wait", "script", "read", "write", "glob", "grep", "probe", "verify", "todo"}
+
+            serial_blocks  = [b for b in tool_blocks if b.name not in PARALLEL_TOOLS or self.conn is None]
+            parallel_blocks = [b for b in tool_blocks if b.name in PARALLEL_TOOLS and self.conn is not None]
+
+            # 직렬 실행
+            serial_results: dict[str, str] = {}
+            for block in serial_blocks:
                 if block.name == "ssh_connect":
                     out = self._handle_ssh_connect(block.input)
                     executor.conn = self.conn
-
                 elif self.conn is None:
                     out = (
                         "[no connection] SSH connection required before using this tool.\n"
                         "Call ssh_connect first. If you don't know the host, use host='scan'."
                     )
-
                 elif block.name == "subagent":
                     known = _extract_known_context(messages)
                     out = run_subagent(
@@ -226,15 +283,37 @@ class AgentLoop:
                         client=self.client,
                         verbose=self.verbose,
                     )
-
                 else:
                     out = executor.execute(block.name, block.input)
+                serial_results[block.id] = out
 
+            # 병렬 실행
+            parallel_results: dict[str, str] = {}
+            if parallel_blocks:
+                with ThreadPoolExecutor(max_workers=min(len(parallel_blocks), 8)) as pool:
+                    futures = {
+                        pool.submit(executor.execute, b.name, b.input): b.id
+                        for b in parallel_blocks
+                    }
+                    for future in as_completed(futures):
+                        bid = futures[future]
+                        try:
+                            parallel_results[bid] = future.result()
+                        except Exception as e:
+                            parallel_results[bid] = f"[error] {e}"
+
+            # 원래 순서대로 tool_results 조립
+            all_results = {**serial_results, **parallel_results}
+            for block in tool_blocks:
+                out = all_results.get(block.id, "[error] no result")
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
                     "content": out,
                 })
+
+            # escalation tracker에 기록
+            escalation.record_tool_results(tool_blocks, all_results)
 
             if tool_results:
                 messages.append({"role": "user", "content": tool_results})
@@ -245,8 +324,18 @@ class AgentLoop:
             if self.conn and turn > 0 and turn % 10 == 0:
                 self._check_connection(messages)
 
-        else:
-            print(f"\n  ⚠️  max turns({max_turns}) reached")
+            turn += 1
+            if turn >= max_turns:
+                print(f"\n  ⚠️  {turn} turns elapsed. goal 미완료 — 계속 진행...", flush=True)
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"[system] {turn} turns elapsed. "
+                        "The goal is still not complete. Keep working. "
+                        "Call done() only when the goal is achieved or proven impossible."
+                    )
+                })
+                max_turns += 50
 
     def _handle_ssh_connect(self, inp: dict) -> str:
         host = inp.get("host", "").strip()
@@ -299,46 +388,117 @@ class AgentLoop:
             print("  ✅ 재연결 성공")
             messages.append({
                 "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": "reconnect_event",
-                    "content": (
-                        "[SSH reconnected]\n"
-                        "Connection was lost and restored. "
-                        "Check board state (running processes, temp files) before continuing."
-                    )
-                }]
+                "content": (
+                    "[SSH reconnected]\n"
+                    "Connection was lost and restored. "
+                    "Check board state (running processes, temp files) before continuing."
+                )
             })
         else:
             print("  ❌ 자동 재연결 실패. 에이전트에게 알림.")
             self.conn = None
             messages.append({
                 "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": "reconnect_event",
-                    "content": (
-                        "[SSH connection lost — reconnect failed]\n"
-                        "Automatic reconnect (3 attempts) failed.\n"
-                        "Use ssh_connect to re-establish connection before continuing."
-                    )
-                }]
+                "content": (
+                    "[SSH connection lost — reconnect failed]\n"
+                    "Automatic reconnect (3 attempts) failed.\n"
+                    "Use ssh_connect to re-establish connection before continuing."
+                )
             })
 
 
 def _build_initial_message(goal: str) -> str:
-    import re
-    lines = [goal]
-    speed = re.search(r'(\d+(?:\.\d+)?)\s*m/s', goal)
-    duration = re.search(r'(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?', goal)
-    if speed or duration:
-        lines.append("")
-        lines.append("Extracted parameters:")
-        if speed:
-            lines.append(f"  - target speed: {speed.group(1)} m/s")
-        if duration:
-            lines.append(f"  - duration: {duration.group(1)} s")
-    return "\n".join(lines)
+    return goal
+
+
+# ─────────────────────────────────────────────────────────────
+# Escalation Tracker
+# ─────────────────────────────────────────────────────────────
+
+class EscalationTracker:
+    """
+    "실행은 됐는데 효과가 없는" 상황을 감지해서
+    다음 turn을 opus+thinking으로 자동 escalate.
+
+    트리거 조건 (OR):
+      1. verify FAIL 2회 연속
+      2. 직전 2개 tool_result에 동일한 실패 패턴 반복
+      3. 같은 bash 명령 3회 이상 반복 (polling 제외)
+    """
+
+    POLLING_KEYWORDS = ("hz", "echo --once", "topic echo", "ps aux", "is-active", "ping")
+    FAIL_KEYWORDS    = ("exit code 1", "exit code 255", "error", "fail", "no data",
+                        "speed: 0.0", "speed=0.0", "0 publishers", "none")
+
+    def __init__(self):
+        self._verify_fail_streak: int = 0
+        self._recent_results: list[str] = []   # 최근 tool_result 텍스트
+        self._bash_counter: dict[str, int] = {}  # 명령 → 호출 횟수
+
+    def record_tool_results(self, tool_blocks: list, results: dict[str, str]) -> None:
+        for block in tool_blocks:
+            out = results.get(block.id, "")
+
+            # verify FAIL 스트릭
+            if block.name == "verify":
+                if "FAIL" in out or "fail" in out.lower():
+                    self._verify_fail_streak += 1
+                else:
+                    self._verify_fail_streak = 0
+
+            # bash 반복 감지 (polling 명령은 제외)
+            if block.name == "bash":
+                cmd = block.input.get("command", "")
+                if not any(kw in cmd for kw in self.POLLING_KEYWORDS):
+                    self._bash_counter[cmd] = self._bash_counter.get(cmd, 0) + 1
+
+            # 최근 결과 누적 (최대 4개)
+            if out:
+                self._recent_results.append(out.lower()[:300])
+                if len(self._recent_results) > 4:
+                    self._recent_results.pop(0)
+
+    def should_escalate(self) -> tuple[bool, str]:
+        """(escalate 여부, 이유) 반환"""
+
+        # 조건 1: verify FAIL 2회 연속
+        if self._verify_fail_streak >= 2:
+            return True, f"verify FAIL {self._verify_fail_streak}회 연속"
+
+        # 조건 2: 직전 2개 결과에 동일 실패 패턴
+        if len(self._recent_results) >= 2:
+            last_two = self._recent_results[-2:]
+            for kw in self.FAIL_KEYWORDS:
+                if all(kw in r for r in last_two):
+                    return True, f"동일 실패 패턴 반복: '{kw}'"
+
+        # 조건 3: 같은 bash 명령 3회 이상
+        for cmd, count in self._bash_counter.items():
+            if count >= 3:
+                return True, f"bash 명령 {count}회 반복: '{cmd[:60]}'"
+
+        return False, ""
+
+    def reset_escalation(self) -> None:
+        """escalate 후 리셋 — sonnet으로 복귀"""
+        self._verify_fail_streak = 0
+        self._bash_counter.clear()
+        self._recent_results.clear()
+
+def _thinking_enabled() -> bool:
+    return os.environ.get("ECC_THINKING", "").lower() in ("1", "true", "yes")
+
+def _thinking_budget() -> int:
+    return _env_int("ECC_THINKING_BUDGET", 8000)
+
+def _print_thinking(text: str) -> None:
+    """thinking 블록을 접어서 출력 — 첫 줄 + 길이 표시."""
+    lines = text.strip().splitlines()
+    first = lines[0][:120] if lines else ""
+    total_chars = len(text)
+    print(f"\n  🧠 thinking ({total_chars}ch): {first}", flush=True)
+    if len(lines) > 1:
+        print(f"     ... ({len(lines)} lines)", flush=True)
 
 
 def _extract_known_context(messages: list[dict]) -> str:

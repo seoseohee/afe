@@ -1,35 +1,41 @@
 """
 ecc_core/compactor.py
 
-Claude Code의 Compressor wU2 구현.
-컨텍스트 윈도우 약 85% 도달 시 대화를 요약하고 핵심만 보존.
-
-Claude Code에서 compaction이 중요한 이유:
-  긴 세션에서 모든 tool 결과를 그대로 유지하면
-  컨텍스트가 금방 차오른다.
-  오래된 탐색 결과 / 실패한 시도 등은 요약으로 대체 가능.
-
-임베디드에서 특히 중요한 이유:
-  하드웨어 탐색 결과 (dmesg, lsusb 등)는 길고 반복적이다.
-  이미 파악한 정보를 계속 들고 다닐 필요가 없다.
-
-보존해야 할 것:
-  - goal
-  - 발견한 하드웨어 정보 (디바이스 경로, 주소, 파라미터)
-  - todo 상태
-  - 실패한 접근법 (재시도 방지)
-  - 마지막으로 성공한 상태
+환경변수:
+  ECC_COMPACT_MODEL   압축용 모델 (기본: ECC_MODEL, 없으면 claude-sonnet-4-6)
+  ECC_CONTEXT_LIMIT   컨텍스트 토큰 한계 (기본: 모델별 자동 설정)
 """
 
+import os
 import anthropic
 
+COMPACT_TRIGGER_RATIO = 0.85
 
-COMPACT_TRIGGER_RATIO = 0.85   # 85% 도달 시 압축
-MODEL_CONTEXT_LIMIT   = 180_000  # claude-opus-4-6 안전 한계
+# 모델별 컨텍스트 한계 (토큰)
+_MODEL_LIMITS = {
+    "claude-opus-4-6":    180_000,
+    "claude-sonnet-4-6":  180_000,
+    "claude-haiku-4-5":   180_000,
+}
+_DEFAULT_LIMIT = 180_000
+
+
+def _compact_model() -> str:
+    main = os.environ.get("ECC_MODEL", "claude-sonnet-4-6")
+    return os.environ.get("ECC_COMPACT_MODEL", main)
+
+def _context_limit() -> int:
+    env = os.environ.get("ECC_CONTEXT_LIMIT")
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    model = _compact_model()
+    return _MODEL_LIMITS.get(model, _DEFAULT_LIMIT)
 
 
 def estimate_tokens(messages: list[dict]) -> int:
-    """대화 토큰 수 대략 추정 (문자 수 ÷ 4)"""
     total = 0
     for m in messages:
         c = m.get("content", "")
@@ -38,8 +44,7 @@ def estimate_tokens(messages: list[dict]) -> int:
 
 
 def should_compact(messages: list[dict]) -> bool:
-    est = estimate_tokens(messages)
-    return est > MODEL_CONTEXT_LIMIT * COMPACT_TRIGGER_RATIO
+    return estimate_tokens(messages) > _context_limit() * COMPACT_TRIGGER_RATIO
 
 
 def compact(
@@ -48,18 +53,10 @@ def compact(
     todo_summary: str,
     client: anthropic.Anthropic,
 ) -> list[dict]:
-    """
-    긴 대화를 요약하고 압축된 컨텍스트로 재시작.
-    
-    반환값은 새로운 messages 리스트.
-    첫 번째 항목은 항상 원래 goal을 담은 user 메시지.
-    두 번째 항목은 요약 내용을 담은 assistant 메시지.
-    """
     print("\n  📦 컨텍스트 압축 중...", flush=True)
 
-    # 대화를 텍스트로 직렬화
     history_lines: list[str] = []
-    for m in messages[1:]:   # 첫 user 메시지(goal) 제외
+    for m in messages[1:]:
         role = m.get("role", "")
         content = m.get("content", "")
 
@@ -71,8 +68,7 @@ def compact(
                     continue
                 btype = block.get("type", "")
                 if btype == "text":
-                    text = block.get("text", "")[:300]
-                    history_lines.append(f"[{role}/text] {text}")
+                    history_lines.append(f"[{role}/text] {block.get('text', '')[:300]}")
                 elif btype == "tool_use":
                     name = block.get("name", "")
                     inp = block.get("input", {})
@@ -82,7 +78,7 @@ def compact(
                     out = str(block.get("content", ""))[:200]
                     history_lines.append(f"[result] {out}")
 
-    history_text = "\n".join(history_lines[-120:])  # 최근 120개 항목만
+    history_text = "\n".join(history_lines[-120:])
 
     prompt = f"""다음은 임베디드 보드 자동화 작업의 대화 기록이다.
 
@@ -102,7 +98,7 @@ def compact(
 
     try:
         resp = client.messages.create(
-            model="claude-opus-4-6",
+            model=_compact_model(),
             max_tokens=800,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -113,14 +109,12 @@ def compact(
     compacted: list[dict] = [
         {
             "role": "user",
-            "content": f"Goal: {goal}"
-        },
-        {
-            "role": "assistant",
             "content": (
-                f"[이전 컨텍스트 요약]\n\n"
+                f"Goal: {goal}\n\n"
+                f"[Context summary from previous turns]\n\n"
                 f"{summary}\n\n"
-                f"[Todo 상태]\n{todo_summary}"
+                f"[Todo status]\n{todo_summary}\n\n"
+                "Continue working toward the goal."
             )
         }
     ]
