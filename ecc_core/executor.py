@@ -3,11 +3,20 @@ ecc_core/executor.py
 
 LLM이 요청한 tool_use를 실제 보드 명령으로 실행한다.
 
-Claude Code의 tool executor와의 차이:
-  - 모든 명령이 SSH를 통해 원격 실행됨
-  - 실패가 '예외'가 아닌 '정상 상태'로 처리됨
-  - probe 같은 임베디드 전용 도구 처리
-  - 위험 명령 검사
+CC tool → ECC 대응:
+  CC Bash(local)          → bash(SSH remote) + script(upload+run)
+  CC Read(local file)     → read(remote path via SSH cat)
+  CC Write(local file)    → write(upload content via SSH) + script(interpreter)
+  CC TaskOutput(async)    → bash(background=True) + bash_wait()
+  [ECC 전용] ssh_connect  → BoardDiscovery.scan / from_hint
+  [ECC 전용] probe        → PROBE_COMMANDS 매핑 (hw/sw/net/motors/lidar/parallel_scan)
+  [ECC 전용] verify       → VERIFY_COMMANDS 매핑 (serial/i2c/ros2/process/system)
+  [ECC 전용] done         → is_finished=True + 터미널 출력
+
+실패 처리 철학:
+  CC: 로컬 명령 실패 → 예외 발생
+  ECC: SSH 명령 실패 → ExecResult(ok=False) → tool_result에 에러 내용 포함
+  실패는 '예외'가 아닌 '정보' — LLM이 다음 행동을 결정
 """
 
 import json
@@ -66,6 +75,7 @@ class ToolExecutor:
         self.verbose = verbose
         self.is_finished = False
         self._bg_tasks: dict[str, _BgTask] = {}   # task_id → _BgTask
+        self._serial_sessions: dict[str, dict] = {}  # session_id → {port, baudrate, history}
 
     def execute(self, tool_name: str, tool_input: dict) -> str:
         """
@@ -73,18 +83,21 @@ class ToolExecutor:
         반환값은 LLM의 tool_result content가 된다.
         """
         dispatch = {
-            "bash":      self._bash,
-            "bash_wait": self._bash_wait,
-            "script":    self._script,
-            "read":      self._read,
-            "write":     self._write,
-            "glob":      self._glob,
-            "grep":      self._grep,
-            "probe":     self._probe,
-            "verify":    self._verify,
-            "todo":      self._todo,
-            "subagent":  self._subagent,
-            "done":      self._done,
+            "bash":          self._bash,
+            "bash_wait":     self._bash_wait,
+            "script":        self._script,
+            "read":          self._read,
+            "write":         self._write,
+            "glob":          self._glob,
+            "grep":          self._grep,
+            "probe":         self._probe,
+            "verify":        self._verify,
+            "serial_open":   self._serial_open,
+            "serial_send":   self._serial_send,
+            "serial_close":  self._serial_close,
+            "todo":          self._todo,
+            "subagent":      self._subagent,
+            "done":          self._done,
         }
         handler = dispatch.get(tool_name)
         if not handler:
@@ -265,9 +278,166 @@ class ToolExecutor:
         if not cmd:
             return f"[error] 알 수 없는 probe target: {target}"
 
-        result = self.conn.run(cmd, timeout=45)
+        # parallel_scan은 254개 IP를 병렬 ping — 더 긴 timeout 필요
+        timeout = 60 if target == "parallel_scan" else 45
+        result = self.conn.run(cmd, timeout=timeout)
         _print_result(result)
         return result.to_tool_result()
+
+    # ─── serial_open ───────────────────────────────────────────
+    # CC v2의 open_serial에 해당
+    # 보드 위에서 Python + pyserial로 세션을 열고 session_id 반환
+
+    def _serial_open(self, inp: dict) -> str:
+        port     = inp["port"]
+        baudrate = inp.get("baudrate", 115200)
+        timeout  = inp.get("timeout", 1.0)
+        desc     = inp.get("description", "")
+
+        _print_tool("serial_open", f"{port} @ {baudrate}", desc)
+
+        # pyserial 설치 확인 + 포트 열기 스크립트를 보드에서 실행
+        # 세션은 보드 위의 Python 프로세스가 아니라
+        # ECC가 관리하는 "보드 위 임시 Python 스크립트" 방식으로 구현
+        # → serial_send마다 1회성 Python 호출 (stateless지만 충분)
+        # 실제 persistent 세션은 백그라운드 socat/miniterm으로 구현 가능하나
+        # 단순성 우선: session_id는 포트+baudrate 메타를 저장하는 ECC 내부 핸들
+
+        session_id = _uuid_mod.uuid4().hex[:8]
+        self._serial_sessions[session_id] = {
+            "port":     port,
+            "baudrate": baudrate,
+            "timeout":  timeout,
+            "desc":     desc,
+            "history":  [],   # IORecord 역할
+        }
+
+        # 포트 접근 가능한지 빠르게 검증
+        check = self.conn.run(
+            f"python3 -c \""
+            f"import serial; s=serial.Serial('{port}', {baudrate}, timeout={timeout}); "
+            f"s.close(); print('ok')\"",
+            timeout=10
+        )
+        if not check.ok:
+            del self._serial_sessions[session_id]
+            _print_result(check)
+            return (
+                f"[serial_open failed] {port} @ {baudrate}\n"
+                f"{check.to_tool_result()}\n"
+                "Hints:\n"
+                "- 포트 경로 확인: probe(target='hw')\n"
+                "- 권한 확인: bash('ls -la /dev/ttyACM* /dev/ttyUSB*')\n"
+                "- pyserial 설치: bash('pip3 install pyserial --break-system-packages')"
+            )
+
+        print(f"    ✅ serial session_id={session_id}  ({port} @ {baudrate})", flush=True)
+        return (
+            f"[serial_open ok] session_id={session_id}\n"
+            f"port={port} baudrate={baudrate} timeout={timeout}\n"
+            f"Use serial_send(session_id='{session_id}', data=...) to communicate."
+        )
+
+    # ─── serial_send ───────────────────────────────────────────
+    # CC v2의 send_then_receive에 해당
+
+    def _serial_send(self, inp: dict) -> str:
+        session_id = inp["session_id"]
+        data       = inp["data"]
+        expect     = inp.get("expect", "")
+        timeout    = inp.get("timeout", 2.0)
+        hex_encode = inp.get("hex_encode", False)
+
+        _print_tool("serial_send", f"session={session_id}", f"data={data[:40]!r}")
+
+        sess = self._serial_sessions.get(session_id)
+        if not sess:
+            return (
+                f"[error] session_id '{session_id}' not found.\n"
+                f"Valid sessions: {list(self._serial_sessions.keys())}\n"
+                "Call serial_open first."
+            )
+
+        port     = sess["port"]
+        baudrate = sess["baudrate"]
+        s_timeout = sess["timeout"]
+
+        # hex 인코딩 처리
+        if hex_encode:
+            send_expr = f"bytes.fromhex('{data.replace(' ', '')}')"
+        else:
+            # 이스케이프 시퀀스 처리 (\\r\\n → \r\n)
+            data_escaped = data.replace("'", "\\'")
+            send_expr = f"'{data_escaped}'.encode().decode('unicode_escape').encode('latin1')"
+
+        # expect 패턴 처리
+        if expect:
+            recv_code = (
+                f"buf=b''; deadline=time.time()+{timeout}\n"
+                f"    while time.time()<deadline:\n"
+                f"        chunk=s.read(s.in_waiting or 1)\n"
+                f"        if chunk: buf+=chunk\n"
+                f"        if b{expect!r} in buf: break\n"
+                f"        time.sleep(0.01)\n"
+            )
+        else:
+            recv_code = (
+                f"time.sleep({timeout})\n"
+                f"    buf=s.read(s.in_waiting or 1)\n"
+            )
+
+        script = (
+            f"import serial, time\n"
+            f"s = serial.Serial('{port}', {baudrate}, timeout={s_timeout})\n"
+            f"tx = {send_expr}\n"
+            f"s.write(tx)\n"
+            f"s.flush()\n"
+            f"{recv_code}"
+            f"s.close()\n"
+            f"print('TX:', tx)\n"
+            f"print('RX:', buf)\n"
+            f"print('RX_TEXT:', buf.decode('utf-8', errors='replace'))\n"
+        )
+
+        result = self.conn.upload_and_run(script, interpreter="python3", timeout=int(timeout) + 5)
+        _print_result(result)
+
+        # IORecord에 히스토리 기록 (CC v2 IORecord 역할)
+        out = result.output()
+        sess["history"].append({
+            "tx": data,
+            "rx": out,
+            "hex": hex_encode,
+        })
+        if len(sess["history"]) > 50:
+            sess["history"].pop(0)
+
+        return result.to_tool_result()
+
+    # ─── serial_close ──────────────────────────────────────────
+
+    def _serial_close(self, inp: dict) -> str:
+        session_id = inp.get("session_id", "")
+
+        if not session_id:
+            # 전체 닫기
+            n = len(self._serial_sessions)
+            self._serial_sessions.clear()
+            _print_tool("serial_close", "all", f"{n}개 세션 닫기")
+            return f"[serial_close] {n}개 세션 모두 닫음."
+
+        _print_tool("serial_close", f"session={session_id}")
+
+        if session_id not in self._serial_sessions:
+            return f"[error] session_id '{session_id}' not found."
+
+        sess = self._serial_sessions.pop(session_id)
+        history_count = len(sess["history"])
+        print(f"    ✅ closed {sess['port']} (송수신 {history_count}회)", flush=True)
+        return (
+            f"[serial_close ok] session_id={session_id} closed.\n"
+            f"port={sess['port']} | total io={history_count}"
+        )
 
     # ─── todo ──────────────────────────────────────────────────
 
@@ -329,6 +499,12 @@ class ToolExecutor:
         summary = inp.get("summary", "")
         evidence = inp.get("evidence", "")
         notes = inp.get("notes", "")
+
+        # 열린 serial 세션 자동 정리
+        if self._serial_sessions:
+            n = len(self._serial_sessions)
+            print(f"\n  🔌 열린 serial 세션 {n}개 자동 닫기...", flush=True)
+            self._serial_sessions.clear()
 
         icon = "✅" if success else "❌"
         print(f"\n{'═'*60}")
