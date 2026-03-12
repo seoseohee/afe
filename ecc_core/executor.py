@@ -317,14 +317,10 @@ class ToolExecutor:
     # ─── subagent ──────────────────────────────────────────────
 
     def _subagent(self, inp: dict) -> str:
-        """
-        독립 컨텍스트에서 탐색/분석 실행.
-        이 메서드는 루프 밖에서 실제 API 호출이 일어나야 하므로
-        AgentLoop에서 직접 처리한다.
-        여기서는 placeholder만 반환.
-        """
-        # 실제 처리는 AgentLoop._run_subagent() 에서
-        return "__subagent_placeholder__"
+        # subagent는 loop.py의 직렬 실행 블록에서 직접 처리된다.
+        # executor.execute()를 통해 이 경로로 오면 안 됨.
+        # PARALLEL_TOOLS에 subagent가 없으므로 정상적으로는 여기 도달하지 않음.
+        return "[error] subagent must be handled by AgentLoop, not ToolExecutor"
 
     # ─── done ──────────────────────────────────────────────────
 

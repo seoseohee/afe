@@ -103,13 +103,13 @@ bash("source /opt/ros/humble/setup.bash && ros2 topic echo /ackermann_cmd --once
 bash("cat ~/vesc_ws/config/vesc.yaml | grep -E 'speed_to_erpm|wheel_radius'")
 
 # Calculate → send minimal command → read back
-script("""
+script('''
 import serial, struct, time
 s = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
 # ... minimal VESC command ...
 resp = s.read(64)
 print('ERPM:', parse_erpm(resp))   # always read back
-""")
+''')
 ```
 
 ---

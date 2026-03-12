@@ -159,7 +159,7 @@ class BoardDiscovery:
 
     @classmethod
     def _default_subnets(cls) -> list[str]:
-        return _env_list("ECC_SUBNETS", "192.168.1,192.168.0,10.0.0,10.42.0")
+        return _env_list("ECC_SUBNETS", "192.168.1,192.168.0,10.0.0,10.42.0,10.101.38")
 
     # loop.py에서 BoardDiscovery.DEFAULT_USERS 직접 참조 호환성 유지
     DEFAULT_USERS = property(lambda self: self._default_users())
@@ -184,9 +184,18 @@ class BoardDiscovery:
 
         known_hosts = os.path.expanduser("~/.ssh/known_hosts")
         if os.path.exists(known_hosts):
-            with open(known_hosts) as f:
+            with open(known_hosts, encoding="utf-8", errors="replace") as f:
                 for line in f:
-                    h = line.split()[0].split(",")[0] if line.strip() else ""
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    # hashed 형식 (|1|...|...) 은 IP 추출 불가 — 스킵
+                    if line.startswith("|"):
+                        continue
+                    h = line.split()[0].split(",")[0]
+                    # [IP]:port 형식 처리
+                    if h.startswith("["):
+                        h = h[1:].split("]")[0]
                     try:
                         ipaddress.ip_address(h)
                         if h not in candidates:
@@ -271,4 +280,11 @@ class BoardDiscovery:
         if not ips:
             for base in cls._default_subnets():
                 ips += [f"{base}.{i}" for i in range(1, 255)]
+        else:
+            # NIC 기반 스캔 결과에 fallback 서브넷도 항상 추가
+            # (보드가 PC와 다른 서브넷에 있을 수 있음)
+            existing_bases = {ip.rsplit(".", 1)[0] for ip in ips}
+            for base in cls._default_subnets():
+                if base not in existing_bases:
+                    ips += [f"{base}.{i}" for i in range(1, 255)]
         return ips

@@ -203,7 +203,11 @@ class AgentLoop:
                 escalate, reason = escalation.should_escalate()
                 turn_model = "claude-opus-4-6" if escalate else model
                 turn_thinking = escalate or _thinking_enabled()
-                turn_max_tokens = max(max_tokens, _thinking_budget() + 4096) if turn_thinking else max_tokens
+                # adaptive 모델은 budget_tokens 없으므로 max_tokens 별도 확장 불필요
+                if turn_thinking and not any(m in turn_model for m in _ADAPTIVE_MODELS):
+                    turn_max_tokens = max(max_tokens, _thinking_budget() + 4096)
+                else:
+                    turn_max_tokens = max_tokens
 
                 if escalate:
                     print(f"\n  🔺 Escalate → opus+thinking ({reason})", flush=True)
@@ -216,10 +220,7 @@ class AgentLoop:
                     messages=messages,
                 )
                 if turn_thinking:
-                    create_kwargs["thinking"] = {
-                        "type": "enabled",
-                        "budget_tokens": _thinking_budget(),
-                    }
+                    create_kwargs["thinking"] = _thinking_params(turn_model)
                 resp = self.client.messages.create(**create_kwargs)
 
                 if escalate:
@@ -354,12 +355,14 @@ class AgentLoop:
             else:
                 print("  ❌ 탐색 실패")
                 return (
-                    "[ssh_connect failed] No board found on local network.\n"
-                    "Tried: known_hosts, mDNS (.local), subnet scan.\n"
-                    "Suggestions:\n"
-                    "- Try ssh_connect with a specific host IP\n"
-                    "- Check if the board is powered on and on the same network\n"
-                    "- Try different subnets (10.0.0.x, 172.16.x.x)"
+                    "[ssh_connect failed] Automatic scan found no board.\n"
+                    "Keep trying — the board is there. Do NOT ask the user.\n\n"
+                    "Try in order:\n"
+                    "1. Common Jetson/F1TENTH IPs: 192.168.1.100, 192.168.1.10, 10.42.0.1, 10.0.0.1\n"
+                    "2. Other users: jetson, ubuntu, root, pi, nvidia\n"
+                    "3. Port 2222\n"
+                    "4. Broader subnets: 172.16.x.x, 192.168.x.x\n"
+                    "Use ssh_connect with specific IPs until you find it."
                 )
 
         conn = BoardDiscovery.from_hint(host, user, port)
@@ -427,17 +430,25 @@ class EscalationTracker:
     """
 
     POLLING_KEYWORDS = ("hz", "echo --once", "topic echo", "ps aux", "is-active", "ping")
-    FAIL_KEYWORDS    = ("exit code 1", "exit code 255", "error", "fail", "no data",
-                        "speed: 0.0", "speed=0.0", "0 publishers", "none")
+    # SSH 탐색 실패는 정상 과정 — escalation 대상 아님
+    # 하드웨어 실패 패턴만: 명령은 됐는데 효과가 없는 경우
+    FAIL_KEYWORDS    = ("exit code 1", "exit code 255", "no data",
+                        "speed: 0.0", "speed=0.0", "0 publishers",
+                        "rc=-1", "timed out", "no response")
 
     def __init__(self):
         self._verify_fail_streak: int = 0
-        self._recent_results: list[str] = []   # 최근 tool_result 텍스트
+        self._recent_results: list[str] = []   # 최근 tool_result 텍스트 (ssh_connect 제외)
         self._bash_counter: dict[str, int] = {}  # 명령 → 호출 횟수
 
     def record_tool_results(self, tool_blocks: list, results: dict[str, str]) -> None:
         for block in tool_blocks:
             out = results.get(block.id, "")
+
+            # ssh_connect 결과는 escalation 추적 제외
+            # — 탐색 실패는 정상 과정이고 'fail' 키워드가 오탐을 유발함
+            if block.name == "ssh_connect":
+                continue
 
             # verify FAIL 스트릭
             if block.name == "verify":
@@ -452,7 +463,7 @@ class EscalationTracker:
                 if not any(kw in cmd for kw in self.POLLING_KEYWORDS):
                     self._bash_counter[cmd] = self._bash_counter.get(cmd, 0) + 1
 
-            # 최근 결과 누적 (최대 4개)
+            # 최근 결과 누적 (최대 4개, ssh_connect 제외)
             if out:
                 self._recent_results.append(out.lower()[:300])
                 if len(self._recent_results) > 4:
@@ -490,6 +501,16 @@ def _thinking_enabled() -> bool:
 
 def _thinking_budget() -> int:
     return _env_int("ECC_THINKING_BUDGET", 8000)
+
+# adaptive thinking: Sonnet 4.6, Opus 4.6 이상 (budget_tokens 없음)
+# enabled thinking:  구형 모델 — budget_tokens 필요
+_ADAPTIVE_MODELS = ("claude-sonnet-4-6", "claude-opus-4-6")
+
+def _thinking_params(model: str) -> dict:
+    if any(m in model for m in _ADAPTIVE_MODELS):
+        return {"type": "adaptive"}
+    else:
+        return {"type": "enabled", "budget_tokens": _thinking_budget()}
 
 def _print_thinking(text: str) -> None:
     """thinking 블록을 접어서 출력 — 첫 줄 + 길이 표시."""
