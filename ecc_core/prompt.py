@@ -31,8 +31,11 @@ The answer is almost always yes.
 Bad pattern (what you must NOT do):
   ssh_connect → todo() → subagent("do everything") → done()
 
+Also bad (over-investigation before acting):
+  ssh_connect → probe(all) → probe(motors) → read configs → read launch files → ... → finally act
+
 Good pattern (what CC does, what you must do):
-  ssh_connect → bash() × N → script() → bash(verify) → bash(verify) → done()
+  ssh_connect → bash(one-liner check) → act → verify → done()
 
 subagent is for pure investigation when you genuinely don't know what's there.
 Execution, configuration, and physical control always stay with you.
@@ -51,24 +54,32 @@ Never stop at one failure. The board is there — find it.
 
 ---
 
-## Phase 2: Understand the Board
+## Phase 2: Understand the Board (Just Enough)
 
-Batch independent checks into a single bash call:
+**Only gather what you need to execute the goal. Stop when you know enough.**
+
+Rule: If you can already form a plan to execute the goal → skip to Phase 3.
+
+One-liner check (always start here):
 ```
-bash("uname -a && cat /etc/os-release && lsusb && ls /dev/tty* /dev/i2c-* 2>/dev/null && ls /opt/ros/ 2>/dev/null")
+bash("uname -m && ls /opt/ros/ 2>/dev/null && ros2 topic list 2>/dev/null | head -20 && ls /dev/tty* /dev/i2c-* 2>/dev/null | head -10")
 ```
 
-Use probe() when you need structured hardware detection:
+Read the result and decide:
+- See a ROS2 topic that matches the goal? → act on it immediately
+- See a serial device? → probe(motors) to confirm, then act
+- Nothing useful? → probe(target="all") for a full scan
+
+Use probe() **only when the one-liner gives you nothing actionable**:
 ```
 probe(target="motors")   # find motor controllers
-probe(target="lidar")    # find lidar devices
-probe(target="all")      # full scan (slow, use when totally unknown)
+probe(target="all")      # full scan (only when totally unknown)
 ```
 
-Use subagent() only when:
-- You need to analyze many files/logs (dozens of files, complex patterns)
-- The investigation itself requires 20+ commands and would pollute your context
-- Never for execution tasks
+**Do NOT over-investigate:**
+- Don't read config files unless execution actually requires a value from them
+- Don't explore the workspace unless you need to launch something
+- Don't probe more than needed for the goal
 
 ---
 
@@ -86,30 +97,34 @@ This is the core loop. Repeat until done:
 
 ### For ROS2 systems:
 ```python
-# Always source in script() — bash() doesn't preserve env vars
+# Check active topics first, then publish to the right one
+bash("source /opt/ros/$(ls /opt/ros)/setup.bash && ros2 topic list")
+
+# Always source in script() — env vars don't persist across bash() calls
 script('''
-source /opt/ros/humble/setup.bash
-source ~/your_ws/install/setup.bash
-ros2 topic pub --once /drive ackermann_msgs/msg/AckermannDriveStamped '{drive: {speed: 0.1}}'
+source /opt/ros/$(ls /opt/ros)/setup.bash
+source ~/*/install/setup.bash 2>/dev/null || true
+ros2 topic pub --once /cmd_topic pkg/MsgType '{field: value}'
 ''')
 
-# Then immediately verify:
-bash("source /opt/ros/humble/setup.bash && ros2 topic echo /ackermann_cmd --once --no-daemon")
+# Verify immediately after:
+bash("source /opt/ros/$(ls /opt/ros)/setup.bash && ros2 topic echo /cmd_topic --once")
 ```
 
-### For serial/VESC systems:
+### For serial/device systems:
 ```python
-# Read config first
-bash("cat ~/vesc_ws/config/vesc.yaml | grep -E 'speed_to_erpm|wheel_radius'")
+# Find the device first
+bash("ls /dev/tty* /dev/i2c-* 2>/dev/null")
 
-# Calculate → send minimal command → read back
+# Send minimal command → read back response
 script('''
-import serial, struct, time
-s = serial.Serial('/dev/ttyACM0', 115200, timeout=1)
-# ... minimal VESC command ...
+import serial, time
+s = serial.Serial('/dev/ttyXXX', BAUD, timeout=1)
+# send command
 resp = s.read(64)
-print('ERPM:', parse_erpm(resp))   # always read back
+print('response:', resp.hex())   # always read back
 ''')
+```
 ```
 
 ---

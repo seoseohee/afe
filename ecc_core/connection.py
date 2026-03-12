@@ -51,9 +51,14 @@ class ExecResult:
             return f"(no output, rc={self.rc})"
         return "\n".join(parts)
 
-    def to_tool_result(self) -> str:
+    def to_tool_result(self, max_chars: int = 4000) -> str:
         status = "ok" if self.ok else f"error(rc={self.rc})"
-        return f"[{status}] {self.duration_ms}ms\n{self.output()}"
+        out = self.output()
+        if len(out) > max_chars:
+            head = out[:max_chars // 2]
+            tail = out[-(max_chars // 4):]
+            out = f"{head}\n...[{len(out)} chars truncated, showing head+tail]...\n{tail}"
+        return f"[{status}] {self.duration_ms}ms\n{out}"
 
 
 class BoardConnection:
@@ -109,18 +114,32 @@ class BoardConnection:
             return ExecResult(ok=False, stdout="", stderr=str(e), rc=-1)
 
     def upload_and_run(self, script: str, interpreter: str = "bash", timeout: int = 60) -> ExecResult:
-        """스크립트를 base64 인코딩해 원격에 직접 쓰고 실행한다. scp 불필요."""
+        """스크립트를 base64 청크로 원격에 쓰고 실행한다. scp/ARG_MAX 문제 없음."""
         import base64 as _b64
         ts = int(time.time() * 1000)
         remote_path = f"/tmp/_ecc_{ts}"
 
-        # base64로 인코딩 → heredoc 특수문자 문제 완전 회피
         b64 = _b64.b64encode(script.encode("utf-8")).decode("ascii")
-        write_cmd = f"printf '%s' {b64} | base64 -d > {remote_path}"
 
-        r = self.run(write_cmd, timeout=15)
+        # 긴 스크립트는 청크로 나눠 전송 (ARG_MAX ~2MB 회피, 안전 기준 4000자)
+        CHUNK = 4000
+        chunks = [b64[i:i+CHUNK] for i in range(0, len(b64), CHUNK)]
+
+        if len(chunks) == 1:
+            write_cmd = f"printf '%s' {chunks[0]} | base64 -d > {remote_path}"
+            r = self.run(write_cmd, timeout=30)
+        else:
+            # 첫 청크는 >, 이후는 >>
+            lines = []
+            for i, chunk in enumerate(chunks):
+                op = ">" if i == 0 else ">>"
+                lines.append(f"printf '%s' {chunk} | base64 -d {op} {remote_path}.b64")
+            lines.append(f"base64 -d {remote_path}.b64 > {remote_path} && rm -f {remote_path}.b64")
+            write_cmd = " && ".join(lines)
+            r = self.run(write_cmd, timeout=30)
+
         if not r.ok:
-            return ExecResult(ok=False, stdout="", stderr=f"script write failed: {r.stderr}", rc=-1)
+            return ExecResult(ok=False, stdout="", stderr=f"script write failed (rc={r.rc}): {r.stderr}", rc=-1)
 
         return self.run(
             f"{interpreter} {remote_path}; _rc=$?; rm -f {remote_path}; exit $_rc",
@@ -159,7 +178,7 @@ class BoardDiscovery:
 
     @classmethod
     def _default_subnets(cls) -> list[str]:
-        return _env_list("ECC_SUBNETS", "192.168.1,192.168.0,10.0.0,10.42.0,10.101.38")
+        return _env_list("ECC_SUBNETS", "192.168.1,192.168.0,10.0.0,10.42.0")
 
     # loop.py에서 BoardDiscovery.DEFAULT_USERS 직접 참조 호환성 유지
     DEFAULT_USERS = property(lambda self: self._default_users())

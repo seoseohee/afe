@@ -4,13 +4,18 @@ ecc_core/loop.py
 ECC v5 — 연결부터 목표 달성까지 에이전트가 전부 담당.
 
 환경변수:
-  ECC_MODEL          메인 에이전트 모델 (기본: claude-sonnet-4-6)
-  ECC_MAX_TOKENS     메인 에이전트 max_tokens (기본: 8096)
-  ECC_COMPACT_MODEL  컨텍스트 압축용 모델 (기본: ECC_MODEL과 동일)
-  ECC_SUBAGENT_TURNS subagent 최대 루프 수 (기본: 40)
+  ECC_MODEL            메인 에이전트 모델 (기본: claude-sonnet-4-6)
+  ECC_ESCALATE_MODEL   escalation 시 모델 (기본: ECC_MODEL의 sonnet→opus 자동 치환)
+  ECC_ADAPTIVE_MODELS  adaptive thinking 지원 모델 목록, 쉼표 구분 (기본: 버전 4.6 이상 자동 감지)
+  ECC_MAX_TOKENS       메인 에이전트 max_tokens (기본: 8096)
+  ECC_THINKING         1이면 thinking 항상 활성화
+  ECC_THINKING_BUDGET  thinking budget_tokens (기본: 8000, adaptive 모델엔 무시됨)
+  ECC_COMPACT_MODEL    컨텍스트 압축용 모델 (기본: ECC_MODEL과 동일)
+  ECC_SUBAGENT_TURNS   subagent 최대 루프 수 (기본: 40)
 """
 
 import os
+import time
 import anthropic
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -30,6 +35,18 @@ def _env_int(key: str, default: int) -> int:
 
 def _main_model() -> str:
     return os.environ.get("ECC_MODEL", "claude-sonnet-4-6")
+
+def _escalate_model() -> str:
+    # escalation 시 쓸 모델 — 기본은 메인 모델의 opus 버전
+    # ECC_ESCALATE_MODEL로 직접 지정 가능
+    env = os.environ.get("ECC_ESCALATE_MODEL")
+    if env:
+        return env
+    # 메인 모델에서 sonnet → opus 자동 추론
+    main = _main_model()
+    if "sonnet" in main:
+        return main.replace("sonnet", "opus")
+    return main  # 이미 opus거나 알 수 없으면 그대로
 
 def _main_max_tokens() -> int:
     return _env_int("ECC_MAX_TOKENS", 8096)
@@ -201,10 +218,10 @@ class AgentLoop:
             try:
                 # escalation 체크 — 이번 turn에 opus+thinking 써야 하는지
                 escalate, reason = escalation.should_escalate()
-                turn_model = "claude-opus-4-6" if escalate else model
+                turn_model = _escalate_model() if escalate else model
                 turn_thinking = escalate or _thinking_enabled()
                 # adaptive 모델은 budget_tokens 없으므로 max_tokens 별도 확장 불필요
-                if turn_thinking and not any(m in turn_model for m in _ADAPTIVE_MODELS):
+                if turn_thinking and not _supports_adaptive(turn_model):
                     turn_max_tokens = max(max_tokens, _thinking_budget() + 4096)
                 else:
                     turn_max_tokens = max_tokens
@@ -225,8 +242,21 @@ class AgentLoop:
 
                 if escalate:
                     escalation.reset_escalation()  # sonnet으로 복귀
+            except anthropic.RateLimitError as e:
+                wait = 60
+                print(f"\n  ⏳ Rate limit (429) — {wait}초 대기 후 재시도...", flush=True)
+                time.sleep(wait)
+                continue
             except anthropic.BadRequestError as e:
-                if "context" in str(e).lower():
+                err_msg = str(e).lower()
+                # 컨텍스트 초과 에러: "prompt is too long", "input is too long",
+                # "context window", "too many tokens" 등 다양한 형식
+                is_context_error = any(kw in err_msg for kw in (
+                    "context", "too long", "too many token", "input length",
+                    "prompt_too_long", "prompt is too long",
+                ))
+                if is_context_error:
+                    print(f"\n  ⚠️  컨텍스트 초과 감지 — 압축 후 재시도", flush=True)
                     messages = compact(messages, goal, todos.format_for_llm(), self.client)
                     continue
                 raise
@@ -358,10 +388,10 @@ class AgentLoop:
                     "[ssh_connect failed] Automatic scan found no board.\n"
                     "Keep trying — the board is there. Do NOT ask the user.\n\n"
                     "Try in order:\n"
-                    "1. Common Jetson/F1TENTH IPs: 192.168.1.100, 192.168.1.10, 10.42.0.1, 10.0.0.1\n"
-                    "2. Other users: jetson, ubuntu, root, pi, nvidia\n"
+                    "1. Common embedded board IPs: 192.168.1.1, 192.168.0.1, 10.42.0.1, 10.0.0.1\n"
+                    "2. Other users: root, ubuntu, pi, admin, nvidia, user\n"
                     "3. Port 2222\n"
-                    "4. Broader subnets: 172.16.x.x, 192.168.x.x\n"
+                    "4. Broader subnets: 172.16.x.x, 10.x.x.x\n"
                     "Use ssh_connect with specific IPs until you find it."
                 )
 
@@ -502,15 +532,24 @@ def _thinking_enabled() -> bool:
 def _thinking_budget() -> int:
     return _env_int("ECC_THINKING_BUDGET", 8000)
 
-# adaptive thinking: Sonnet 4.6, Opus 4.6 이상 (budget_tokens 없음)
-# enabled thinking:  구형 모델 — budget_tokens 필요
-_ADAPTIVE_MODELS = ("claude-sonnet-4-6", "claude-opus-4-6")
+# adaptive thinking 지원 모델 — ECC_ADAPTIVE_MODELS로 추가 가능
+# 기본: 4.6 이상 모델은 adaptive 지원 (모델명에 숫자 버전으로 판단)
+def _supports_adaptive(model: str) -> bool:
+    env = os.environ.get("ECC_ADAPTIVE_MODELS")
+    if env:
+        return any(m.strip() in model for m in env.split(","))
+    # 기본 규칙: major.minor >= 4.6 이면 adaptive 지원
+    import re
+    m = re.search(r"(\d+)[\.-](\d+)", model)
+    if m:
+        major, minor = int(m.group(1)), int(m.group(2))
+        return (major, minor) >= (4, 6)
+    return False
 
 def _thinking_params(model: str) -> dict:
-    if any(m in model for m in _ADAPTIVE_MODELS):
+    if _supports_adaptive(model):
         return {"type": "adaptive"}
-    else:
-        return {"type": "enabled", "budget_tokens": _thinking_budget()}
+    return {"type": "enabled", "budget_tokens": _thinking_budget()}
 
 def _print_thinking(text: str) -> None:
     """thinking 블록을 접어서 출력 — 첫 줄 + 길이 표시."""
