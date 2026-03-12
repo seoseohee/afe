@@ -49,7 +49,7 @@ ssh_connect(host="scan")           # unknown IP → scan
 ssh_connect(host="192.168.1.100")  # known IP → direct
 ```
 
-If it fails: try different IP, user (root/ubuntu/jetson/pi/admin), port (22/2222).
+If it fails: try different IP, different user, port (22/2222). Users to try: check ECC_USERS defaults (root, ubuntu, pi, admin, etc.).
 Never stop at one failure. The board is there — find it.
 
 ---
@@ -149,10 +149,32 @@ If verification fails → diagnose → fix → retry. Do not call done().
 
 ## Physical Constraints (Never Assume)
 
-**Motor deadbands**: Every motor has a minimum effective command. 
-Find it by incrementing from zero. If 0.1 m/s is below minimum:
-- Measure the actual minimum
-- Report what IS achievable: done(success=false, evidence="min speed = 0.32 m/s at ERPM=1500")
+**Motor deadbands**: Every motor has a minimum effective ERPM before it physically moves.
+If you send a command and `speed: 0.0` / `current_motor: 0.0` persist (fault_code=0, but no motion):
+
+**This is a deadband problem. Do NOT keep resending the same command.**
+
+Step 1 — Measure the deadband automatically by ramping ERPM:
+```bash
+for erpm in 500 1000 1500 2000 3000 5000; do
+  ros2 topic pub --times 20 /commands/motor/speed std_msgs/msg/Float64 "{data: $erpm}" &
+  sleep 1
+  echo -n "ERPM=$erpm → "; ros2 topic echo /sensors/core --once 2>/dev/null | grep "speed:"
+  kill %1 2>/dev/null
+done
+```
+
+Step 2 — Once you know the minimum ERPM where speed > 0:
+- Convert: `min_speed = min_erpm / speed_to_erpm_gain`
+- **Do NOT run at that speed without asking.**
+- Call `done(success=false)` and tell the user:
+  ```
+  done(success=false,
+       summary="0.1 m/s is below the motor deadband.",
+       evidence="Deadband threshold: ERPM=X (Y m/s). Commands below this produce no motion.",
+       notes="Can achieve forward motion at Z m/s minimum. Run at Z m/s instead?")
+  ```
+- The user decides whether to proceed at the achievable speed.
 
 **Serial**: Baud rate must match exactly. Probe first.
 

@@ -351,15 +351,14 @@ def _print_tool(name: str, detail: str = "", desc: str = ""):
     desc_str = f"  # {desc}" if desc else ""
     print(f"\n  ▶ {name}  {detail}{desc_str}", flush=True)
 
-def _print_result(result: ExecResult):
+def _print_result(result: ExecResult, max_chars: int = 4000):
+    """터미널 출력 — to_tool_result와 동일한 4000자 기준으로 일관성 유지."""
     out = result.output()
     if not out.strip():
         return
-    if len(out) > 800:
-        preview = out[:600]
-        tail = out[-150:]
-        print(f"  {preview}\n  ...({len(out)}자)...\n  {tail}", flush=True)
-    else:
-        # 들여쓰기
-        for line in out.splitlines():
-            print(f"  {line}", flush=True)
+    if len(out) > max_chars:
+        head = out[:max_chars // 2]
+        tail = out[-(max_chars // 4):]
+        out = f"{head}\n  ...({len(out)}자 truncated)...\n{tail}"
+    for line in out.splitlines():
+        print(f"  {line}", flush=True)

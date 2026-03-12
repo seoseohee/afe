@@ -384,14 +384,16 @@ class AgentLoop:
                 return f"[ssh_connect ok] Connected to {conn.address}"
             else:
                 print("  ❌ 탐색 실패")
+                subnets = ", ".join(BoardDiscovery._default_subnets()[:4])
+                users   = ", ".join(BoardDiscovery._default_users())
                 return (
                     "[ssh_connect failed] Automatic scan found no board.\n"
                     "Keep trying — the board is there. Do NOT ask the user.\n\n"
                     "Try in order:\n"
-                    "1. Common embedded board IPs: 192.168.1.1, 192.168.0.1, 10.42.0.1, 10.0.0.1\n"
-                    "2. Other users: root, ubuntu, pi, admin, nvidia, user\n"
+                    f"1. Specific IPs in scanned subnets ({subnets})\n"
+                    f"2. Other users: {users}\n"
                     "3. Port 2222\n"
-                    "4. Broader subnets: 172.16.x.x, 10.x.x.x\n"
+                    "4. Broader subnets — try ssh_connect with host='scan' again or specific IP\n"
                     "Use ssh_connect with specific IPs until you find it."
                 )
 

@@ -11,16 +11,13 @@ import anthropic
 
 COMPACT_TRIGGER_RATIO = 0.85
 
-# 모델별 컨텍스트 한계 (토큰)
-_MODEL_LIMITS = {
-    "claude-opus-4-6":    180_000,
-    "claude-sonnet-4-6":  180_000,
-    "claude-haiku-4-5":   180_000,
-}
-_DEFAULT_LIMIT = 180_000
+# 컨텍스트 한계: 모든 현재 Claude 모델은 200k window.
+# ECC_CONTEXT_LIMIT으로 직접 지정하거나 기본값 사용.
+_DEFAULT_LIMIT = 180_000  # 실제 200k 중 안전 마진
 
 
 def _compact_model() -> str:
+    # loop.py의 ECC_MODEL 기본값과 동일 소스에서 읽어 중복 제거
     main = os.environ.get("ECC_MODEL", "claude-sonnet-4-6")
     return os.environ.get("ECC_COMPACT_MODEL", main)
 
@@ -31,8 +28,7 @@ def _context_limit() -> int:
             return int(env)
         except ValueError:
             pass
-    model = _compact_model()
-    return _MODEL_LIMITS.get(model, _DEFAULT_LIMIT)
+    return _DEFAULT_LIMIT
 
 
 def estimate_tokens(messages: list[dict]) -> int:

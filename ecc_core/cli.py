@@ -29,7 +29,7 @@ def main():
 
           # 힌트 제공 (탐색 속도 향상, 필수 아님)
           ecc --host 192.168.1.100 "차량 주행시켜"
-          ecc --host 10.0.0.1 --user jetson "lidar 데이터 확인해줘"
+          ecc --host 10.0.0.1 "lidar 데이터 확인해줘"
 
           # REPL 모드
           ecc
@@ -91,7 +91,7 @@ def _build_hint(args) -> str:
 
 
 def _repl(agent: AgentLoop, hint: str, args):
-    model = os.environ.get("ECC_MODEL", "claude-sonnet-4-6")
+    model = os.environ.get("ECC_MODEL", "claude-sonnet-4-6")  # loop.py와 동일 소스
     print(f"""
 {'═'*60}
   🤖 ECC — Embedded Claude Code  [{model}]

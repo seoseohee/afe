@@ -48,7 +48,7 @@ bash/script/probe 등 다른 도구를 쓰기 전에 반드시 연결이 되어 
 
 연결 실패 시 에이전트가 해야 할 것:
 - 다른 IP 범위 시도
-- 다른 user 시도 (root, ubuntu, jetson, pi, admin)
+- 다른 user 시도 (ECC_USERS 기본값 순서대로 — connection.py 참조)
 - 포트 확인 (22, 2222)
 - 사용자에게 물어보기 (AskUser 없으면 bash로 네트워크 상태 확인)
 - 절대 포기하지 않는다""",
@@ -61,7 +61,7 @@ bash/script/probe 등 다른 도구를 쓰기 전에 반드시 연결이 되어 
                 },
                 "user": {
                     "type": "string",
-                    "description": "SSH 사용자. 기본: 순서대로 root, ubuntu, jetson, pi, admin 시도.",
+                    "description": "SSH 사용자. 기본: ECC_USERS 환경변수 순서대로 시도 (root, ubuntu, pi, admin 등).",
                     "default": ""
                 },
                 "port": {
@@ -386,7 +386,7 @@ subagent는 "뭐가 있는지 알아봐줘" 전용이다. "해줘"가 아니다.
 올바른 사용:
   ✅ subagent("이 보드에 어떤 모터 컨트롤러가 있는지 조사해라")
   ✅ subagent("ROS2 launch 파일 구조와 topic 흐름을 분석해라")
-  ✅ subagent("VESC 설정 파일을 찾아서 파라미터를 정리해라")
+  ✅ subagent("모터 컨트롤러 설정 파일을 찾아서 파라미터를 정리해라")
 
 잘못된 사용:
   ❌ subagent("모터를 0.1 m/s로 5초 달려라")  → 메인이 직접 script()로 해라
@@ -443,7 +443,7 @@ device 파라미터:
   "i2c_device"    → "1:0x68"  (버스:주소)
   "network_device"→ "192.168.0.10:80"
   "ros2_topic"    → "/scan"
-  "process"       → "vesc_driver" 또는 "ros2"
+  "process"       → "motor_driver" 또는 "ros2"
   "system"        → "" (불필요)
   "custom"        → 확인할 내용 설명
 
@@ -506,8 +506,8 @@ verify 결과에서 얻은 파라미터 값(baud rate, 응답 포맷 등)은 이
                     "description": (
                         "하드웨어가 실제로 반응했다는 증거. "
                         "물리 동작 goal에서 required. "
-                        "예: 'ros2 topic echo /ackermann_cmd → speed=0.1 확인', "
-                        "'VESC 텔레메트리 ERPM=461 수신', "
+                        "예: 'ros2 topic echo /cmd_topic → speed=0.1 확인', "
+                        "'모터 컨트롤러 텔레메트리 speed=0.1 수신', "
                         "'dmesg에서 장치 인식 로그 확인'"
                     )
                 },
@@ -571,7 +571,7 @@ echo "=== 설치된 언어/런타임 ===" && for cmd in node java rustc go; do w
 echo "=== 네트워크 인터페이스 ===" && ip addr show 2>/dev/null | grep -E "(inet |^[0-9])"
 echo "=== 연결된 외부 IP ===" && ip route 2>/dev/null
 echo "=== 열린 포트 ===" && ss -tlnp 2>/dev/null | head -20
-echo "=== 외부 디바이스 ping (192.168.0.x) ===" && for ip in 192.168.0.{1..20}; do ping -c1 -W1 $ip >/dev/null 2>&1 && echo "  alive: $ip"; done
+echo "=== ARP 캐시 (인접 장치) ===" && ip neigh show 2>/dev/null | grep -v "FAILED" | head -20
 """.strip(),
 
     "perf": """
@@ -583,7 +583,7 @@ echo "=== 부하 ===" && uptime 2>/dev/null
 echo "=== GPU/가속기 ===" && nvidia-smi 2>/dev/null | head -10 || tegrastats --interval 1000 2>/dev/null & sleep 2; kill %1 2>/dev/null; wait 2>/dev/null
 """.strip(),
 
-    "motors": """
+    "motors": r"""
 echo "=== 시리얼 장치 (모터 컨트롤러 후보) ==="
 ls -la /dev/ttyACM* /dev/ttyUSB* /dev/ttyS* 2>/dev/null || echo "(시리얼 장치 없음)"
 echo "=== CAN 인터페이스 ==="
@@ -606,7 +606,7 @@ echo "=== 카메라 도구 ===" && which v4l2-ctl 2>/dev/null && v4l2-ctl --list
 echo "=== 카메라 Python 패키지 ===" && pip3 list 2>/dev/null | grep -iE "(cv2|opencv|picamera|pyrealsense|pypylon)" || echo "(없음)"
 """.strip(),
 
-    "lidar": """
+    "lidar": r"""
 echo "=== USB/시리얼 LiDAR ==="
 lsusb 2>/dev/null | grep -iE "(laser|lidar|hokuyo|rplidar|sick|velodyne|ouster|urg)" || echo "(USB에서 못 찾음)"
 ls /dev/ttyACM* /dev/ttyUSB* 2>/dev/null | head -10
@@ -761,19 +761,3 @@ echo "custom verify: ${ECC_DEVICE}"
 # ECC_DEVICE에 확인할 내용이 담겨 있음. executor가 추가 처리.
 """.strip(),
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
