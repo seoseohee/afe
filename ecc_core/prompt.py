@@ -101,6 +101,57 @@ Always source in script() — env vars don't persist across bash() calls:
   # Immediately verify — fire this in the same response as the action above:
   bash("source /opt/ros/$(ls /opt/ros)/setup.bash && ros2 topic echo /cmd_topic --once 2>/dev/null")
 
+### ⚠️ ros2 topic pub — CRITICAL rules
+
+NEVER use --once in a loop. Each --once spawns a new ROS2 node (~1s startup).
+30 iterations × 1s = 30s → always times out.
+
+CORRECT patterns:
+  # Single burst (verify pipeline):
+  ros2 topic pub --once /topic pkg/Msg "{data: value}"
+
+  # Sustained publish for N seconds at R Hz:
+  ros2 topic pub --rate R --times $((R * N)) /topic pkg/Msg "{data: value}"
+  # Example: 1 m/s for 3s at 10 Hz = --rate 10 --times 30
+
+  # Background + foreground telemetry (see Phase 6 for full pattern):
+  ros2 topic pub --rate 10 --times 30 /drive ... &
+  PUB=$!; sleep 1
+  ros2 topic echo /commands/motor/speed --once
+  wait $PUB
+
+NEVER do this:
+  ✗ for i in $(seq 30); do ros2 topic pub --once ...; sleep 0.1; done
+
+### ⚠️ Sustained commands (motor, actuator): publish in background, read DURING motion
+
+For commands that run for N seconds, you MUST capture telemetry while the motor is spinning.
+Reading telemetry AFTER the script returns will always show speed=0.0 (motor already stopped).
+
+  script(code='''
+  source /opt/ros/humble/setup.bash && source ~/*/install/setup.bash 2>/dev/null || true
+
+  # background publisher (N seconds)
+  (for i in $(seq 100); do
+    ros2 topic pub --once /drive ackermann_msgs/msg/AckermannDriveStamped \
+      "{drive: {speed: 1.0}}" --qos-reliability best_effort 2>/dev/null
+    sleep 0.1
+  done) &
+  PUB_PID=$!
+
+  sleep 1.0  # motor spin-up
+
+  # read telemetry WHILE motor is running
+  for i in $(seq 5); do
+    echo -n "t=$i → "
+    ros2 topic echo /commands/motor/speed --once 2>/dev/null | grep data || echo "no data"
+    sleep 0.5
+  done
+
+  wait $PUB_PID
+  echo "run complete"
+  ''', interpreter="bash", timeout=20)
+
 ### Serial/device systems
   script(code='''
   import serial, time
@@ -133,7 +184,7 @@ This is NOT a software bug. The ERPM is below the motor's minimum effective thre
 Do NOT keep resending the same command. Measure the deadband:
 
   for erpm in 500 1000 1500 2000 3000 5000; do
-    ros2 topic pub --times 20 /commands/motor/speed std_msgs/msg/Float64 "{data: $erpm}" &
+    ros2 topic pub --rate 10 --times 20 /commands/motor/speed std_msgs/msg/Float64 "{data: $erpm}" &
     sleep 1
     echo -n "ERPM=$erpm → "
     ros2 topic echo /sensors/core --once 2>/dev/null | grep "speed:"
@@ -220,6 +271,60 @@ Never call done() immediately after sending a command.
   Service start        → bash("systemctl is-active name")
   Serial send          → read response bytes
 
+### ⚠️ Verification Timing — Capture During the Run, Not After
+
+WRONG (command finishes before you read):
+  script("publish 1.0 m/s for 5s")  # waits 5s, then returns
+  bash("ros2 topic echo /sensors/core --once")  # reads AFTER motor stopped → speed=0.0
+
+RIGHT — run publisher in background, read telemetry simultaneously:
+  script(code='''
+  source /opt/ros/humble/setup.bash && source ~/*/install/setup.bash 2>/dev/null || true
+
+  # publisher in background
+  (for i in $(seq 50); do
+    ros2 topic pub --once /drive ackermann_msgs/msg/AckermannDriveStamped \\
+      "{header: {stamp: {sec: 0}}, drive: {speed: 1.0, steering_angle: 0.0}}" \\
+      --qos-reliability best_effort 2>/dev/null
+    sleep 0.1
+  done) &
+  PUB_PID=$!
+
+  sleep 0.5  # let motor spin up
+
+  # read telemetry during motion
+  for i in $(seq 8); do
+    ros2 topic echo /commands/motor/speed --once 2>/dev/null | grep data || true
+    sleep 0.3
+  done
+
+  wait $PUB_PID
+  ''', interpreter="bash", timeout=15)
+
+### ⚠️ vesc_msgs not installed? Use alternative telemetry
+
+If `ros2 topic echo /sensors/core` fails with "message type invalid":
+  # Alternative 1: motor speed command (always available)
+  bash("source ... && ros2 topic echo /commands/motor/speed --once")
+  # → shows ERPM being sent to VESC (e.g. data: 4614.0)
+
+  # Alternative 2: odom (computed from ERPM)
+  bash("source ... && ros2 topic echo /odom --once | grep -A3 'twist:'")
+  # → shows linear.x velocity
+
+  # Alternative 3: distance_traveled via Python pyserial direct VESC read
+  script(code='''
+  import serial, struct, time
+  s = serial.Serial("/dev/ttyACM0", 115200, timeout=0.5)
+  # VESC get values command: 0x02 0x01 0x04 0x40 0x84 0x03
+  s.write(bytes([0x02, 0x01, 0x04, 0x40, 0x84, 0x03]))
+  data = s.read(70)
+  if len(data) >= 8:
+      erpm = struct.unpack(">i", data[4:8])[0]
+      print(f"ERPM: {erpm}")
+  s.close()
+  ''', interpreter="python3")
+
 If verification fails → parallel hypotheses → fix → retry.
 
 """
@@ -256,6 +361,31 @@ _SECTION_TOOLS = """\
   Track progress              todo(todos=[...])
   Signal completion           done(success, summary, evidence)
   Impossible → propose alt    done(success=false, notes="Min achievable: Z. Proceed?")
+  Ambiguous critical param    ask_user(question="...", context="why needed")
+
+### ask_user — 언제 쓰고 언제 쓰지 않는가
+
+쓰는 경우 (probe/bash로 알 수 없는 것):
+  ask_user("SSH 비밀번호가 필요합니다. 입력해주세요.")
+  ask_user("포맷하면 데이터가 지워집니다. 계속할까요? (yes/no)")
+  ask_user("타겟 장치가 /dev/ttyACM0 입니까 /dev/ttyACM1 입니까?",
+           context="두 장치가 모두 연결되어 있어 자동 판별 불가")
+
+쓰지 않는 경우 (스스로 알 수 있는 것):
+  ✗ 보드 IP → ssh_connect(host="scan")으로 직접 탐색
+  ✗ ROS2 토픽명 → bash("ros2 topic list")
+  ✗ 기본 속도 → goal에 명시 없으면 안전한 기본값 사용
+
+### bash/read/write/glob/grep — SSH 없이도 로컬 실행 가능
+
+conn=None (ssh_connect 이전) 상태에서도 이 도구들은 로컬 머신에서 실행된다.
+용도: ssh-keyscan, 로컬 config 읽기, 네트워크 사전 점검 등.
+
+  bash("ssh-keyscan -H 10.0.0.1 >> ~/.ssh/known_hosts")  # conn 없이도 OK
+  read("/etc/hosts")                                       # 로컬 파일 읽기
+  bash("ip route")                                         # 로컬 네트워크 확인
+
+conn 연결 후에는 동일 도구가 원격 보드에서 실행된다.
 
 Serial vs script 선택 기준:
   serial_open/send  → 대화형 프로토콜 탐색, request-response 반복, 세션 유지 필요
@@ -269,4 +399,5 @@ Anti-patterns (never do these):
   ✗ Assuming hardware responded without reading telemetry
   ✗ bash() for multi-step ROS2 (use script())
   ✗ serial_open 후 serial_close 없이 done() 호출 (자동 닫히지만 명시하는 게 좋음)
+  ✗ ask_user로 bash/probe로 알 수 있는 것 물어보기
 """

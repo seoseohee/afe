@@ -649,10 +649,7 @@ verify 결과에서 얻은 파라미터 값(baud rate, 응답 포맷 등)은 이
             },
             "required": ["success", "summary", "evidence"]
         }
-    }
-]
-
-
+    }]
 # ─────────────────────────────────────────────────────────────
 # 위험 명령 필터
 # Claude Code의 permission system에 해당
@@ -926,3 +923,49 @@ echo "custom verify: ${ECC_DEVICE}"
 # ECC_DEVICE에 확인할 내용이 담겨 있음. executor가 추가 처리.
 """.strip(),
 }
+
+
+# ─────────────────────────────────────────────────────────────
+# Optional tools (opt-in via environment variable)
+# ECC_ASK_USER=1 일 때만 TOOL_DEFINITIONS에 포함
+# ─────────────────────────────────────────────────────────────
+
+ASK_USER_TOOL = {
+        "name": "ask_user",
+        "description": """목표 수행에 필요한 정보가 부족하거나 명확하지 않을 때 사용자에게 직접 질문한다.
+
+사용 조건 (모두 해당해야 함):
+- 추정/추론으로 진행할 수 없는 정보 (예: 비밀번호, 인증서 경로)
+- 잘못 추정하면 하드웨어 손상/데이터 손실 위험이 있는 경우
+- 여러 선택지가 있고 사용자 의도가 불분명한 경우
+
+사용 금지 (스스로 판단할 수 있는 것):
+- probe/bash로 확인 가능한 정보 (IP, 포트, 파일 경로 등)
+- 합리적인 기본값이 있는 설정 (속도, 타임아웃 등)
+- 이미 goal에 충분한 정보가 있는 경우
+
+질문은 짧고 구체적으로. yes/no 또는 단답형으로 답할 수 있게 작성.""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "사용자에게 물을 질문. 선택지가 있으면 나열."
+                },
+                "context": {
+                    "type": "string",
+                    "description": "왜 이 정보가 필요한지 한 줄 설명",
+                    "default": ""
+                }
+            },
+            "required": ["question"]
+        }
+    }
+
+def get_tool_definitions() -> list:
+    """환경변수에 따라 활성 도구 목록을 반환한다."""
+    import os
+    tools = list(TOOL_DEFINITIONS)
+    if os.environ.get("ECC_ASK_USER") == "1":
+        tools.append(ASK_USER_TOOL)
+    return tools

@@ -20,6 +20,8 @@ CC tool → ECC 대응:
 """
 
 import json
+import os
+import subprocess
 import threading
 import uuid as _uuid_mod
 from dataclasses import dataclass, field
@@ -81,27 +83,23 @@ class ToolExecutor:
         """
         tool_name에 따라 실행하고 결과 문자열 반환.
         반환값은 LLM의 tool_result content가 된다.
+
+        dispatch는 getattr 기반 — 하드코딩 테이블 없음.
+        tool_name → self._<tool_name> 메서드로 자동 라우팅.
+        메서드가 없으면 에러 문자열 반환 (예외 없음).
         """
-        dispatch = {
-            "bash":          self._bash,
-            "bash_wait":     self._bash_wait,
-            "script":        self._script,
-            "read":          self._read,
-            "write":         self._write,
-            "glob":          self._glob,
-            "grep":          self._grep,
-            "probe":         self._probe,
-            "verify":        self._verify,
-            "serial_open":   self._serial_open,
-            "serial_send":   self._serial_send,
-            "serial_close":  self._serial_close,
-            "todo":          self._todo,
-            "subagent":      self._subagent,
-            "done":          self._done,
-        }
-        handler = dispatch.get(tool_name)
-        if not handler:
-            return f"[error] 알 수 없는 도구: {tool_name}"
+        handler = getattr(self, f"_{tool_name}", None)
+        if handler is None:
+            return (
+                f"[error] 알 수 없는 도구: {tool_name}\n"
+                f"사용 가능한 도구: "
+                + ", ".join(
+                    n[1:] for n in dir(self)
+                    if n.startswith("_") and not n.startswith("__")
+                    and callable(getattr(self, n))
+                    and n[1:] not in ("bg_tasks", "serial_sessions")
+                )
+            )
         return handler(tool_input)
 
     # ─── bash ──────────────────────────────────────────────────
@@ -135,7 +133,10 @@ class ToolExecutor:
                 f"Use bash_wait(task_id='{task_id}') to retrieve the result."
             )
 
-        result = self.conn.run(cmd, timeout=timeout)
+        if self.conn is None:
+            result = _local_run(cmd, timeout=timeout)
+        else:
+            result = self.conn.run(cmd, timeout=timeout)
         _print_result(result)
         return result.to_tool_result()
 
@@ -200,7 +201,10 @@ class ToolExecutor:
         else:
             cmd = f"cat {path}"
 
-        result = self.conn.run(cmd, timeout=15)
+        if self.conn is None:
+            result = _local_run(cmd, timeout=15)
+        else:
+            result = self.conn.run(cmd, timeout=15)
         _print_result(result)
         return result.to_tool_result()
 
@@ -212,6 +216,11 @@ class ToolExecutor:
         mode = inp.get("mode", "")
 
         _print_tool("write", path)
+
+        if self.conn is None:
+            result = _local_write(path, content, mode)
+            _print_result(result)
+            return result.to_tool_result()
 
         result = self.conn.upload_and_run(
             f"mkdir -p $(dirname {path})",
@@ -244,7 +253,10 @@ class ToolExecutor:
         else:
             cmd = f"find {base} -path '*{pattern}*' 2>/dev/null | head -50"
 
-        result = self.conn.run(cmd, timeout=20)
+        if self.conn is None:
+            result = _local_run(cmd, timeout=20)
+        else:
+            result = self.conn.run(cmd, timeout=20)
         _print_result(result)
         return result.to_tool_result()
 
@@ -263,7 +275,10 @@ class ToolExecutor:
             f"(rg {flags} --max-count {max_results} '{pattern}' {path} 2>/dev/null) "
             f"|| (grep {flags} --max-count {max_results} '{pattern}' {path} 2>/dev/null)"
         )
-        result = self.conn.run(cmd, timeout=20)
+        if self.conn is None:
+            result = _local_run(cmd, timeout=20)
+        else:
+            result = self.conn.run(cmd, timeout=20)
         _print_result(result)
         return result.to_tool_result()
 
@@ -522,6 +537,70 @@ class ToolExecutor:
 # ─────────────────────────────────────────────────────────────
 # 출력 헬퍼
 # ─────────────────────────────────────────────────────────────
+
+# ── 로컬 실행 헬퍼 (conn=None 상태에서 사용) ───────────────────────────
+
+def _local_run(cmd: str, timeout: int = 30) -> ExecResult:
+    """SSH 없이 로컬 shell에서 명령을 실행한다."""
+    import time
+    t0 = time.monotonic()
+    try:
+        r = subprocess.run(
+            cmd, shell=True, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=timeout
+        )
+        elapsed = int((time.monotonic() - t0) * 1000)
+        return ExecResult(
+            ok=r.returncode == 0,
+            stdout=r.stdout, stderr=r.stderr,
+            rc=r.returncode, duration_ms=elapsed,
+        )
+    except subprocess.TimeoutExpired:
+        elapsed = int((time.monotonic() - t0) * 1000)
+        return ExecResult(ok=False, stdout="", stderr=f"local timeout after {timeout}s", rc=-1, duration_ms=elapsed)
+    except Exception as e:
+        return ExecResult(ok=False, stdout="", stderr=str(e), rc=-1)
+
+
+def _local_write(path: str, content: str, mode: str = "") -> ExecResult:
+    """로컬 파일을 쓴다. 디렉토리가 없으면 생성."""
+    import time
+    t0 = time.monotonic()
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        if mode:
+            os.chmod(path, int(mode, 8))
+        elapsed = int((time.monotonic() - t0) * 1000)
+        return ExecResult(ok=True, stdout=f"written {len(content)} bytes to {path}", stderr="", rc=0, duration_ms=elapsed)
+    except Exception as e:
+        return ExecResult(ok=False, stdout="", stderr=str(e), rc=1)
+
+
+
+    # ─── ask_user ───────────────────────────────────────────────
+
+    def _ask_user(self, inp: dict) -> str:
+        """에이전트가 사용자에게 질문한다. 루프를 일시 정지하고 터미널 입력을 받는다."""
+        question = inp["question"]
+        context = inp.get("context", "")
+
+        print("\n" + "─" * 60, flush=True)
+        if context:
+            print(f"  ℹ️  {context}", flush=True)
+        print(f"  ❓ {question}", flush=True)
+        print("─" * 60, flush=True)
+        try:
+            answer = input("  답변: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+            print("\n  (입력 없음 — 빈 답변으로 처리)", flush=True)
+
+        if not answer:
+            return "[ask_user] No answer provided. Proceed with best-effort assumption."
+        return f"[ask_user] User answered: {answer}"
+
 
 def _print_tool(name: str, detail: str = "", desc: str = ""):
     desc_str = f"  # {desc}" if desc else ""

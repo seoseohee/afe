@@ -91,18 +91,23 @@ def _build_hint(args) -> str:
 
 
 def _repl(agent: AgentLoop, hint: str, args):
-    model = os.environ.get("ECC_MODEL", "claude-sonnet-4-6")  # loop.py와 동일 소스
+    model = os.environ.get("ECC_MODEL", "claude-sonnet-4-6")
     print(f"""
 {'═'*60}
   🤖 ECC — Embedded Claude Code  [{model}]
   goal을 입력하세요. 에이전트가 보드를 찾아서 실행합니다.
-  명령어: /quit
+  명령어: /quit  /new(새 세션)
 {'═'*60}
 """)
 
     while True:
         try:
-            raw = input("ecc> ").strip()
+            # 이전 세션 있으면 프롬프트에 표시
+            if agent._session_messages:
+                prompt = f"ecc[{len(agent._session_messages)}]> "
+            else:
+                prompt = "ecc> "
+            raw = input(prompt).strip()
         except (EOFError, KeyboardInterrupt):
             print("\n  종료합니다.")
             break
@@ -112,8 +117,19 @@ def _repl(agent: AgentLoop, hint: str, args):
         if raw.lower() in ("/quit", "/exit", "/q"):
             print("  종료합니다.")
             break
+        if raw.lower() in ("/new", "/reset", "/clear"):
+            agent._session_messages = []
+            agent._session_goal = ""
+            agent._session_todos = None
+            agent._session_executor = None
+            print("  🆕 새 세션 시작.")
+            continue
 
         try:
             agent.run(raw + hint, max_turns=args.max_turns)
         except KeyboardInterrupt:
+            # Ctrl+C: 부분 세션 저장 (followup 가능하도록)
+            agent._save_partial_session()
             print("\n  ⚡ 현재 작업 중단. 다음 goal을 입력하세요.")
+        except Exception as e:
+            print(f"\n  ❌ 오류: {e}")

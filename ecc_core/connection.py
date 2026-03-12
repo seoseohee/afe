@@ -51,9 +51,38 @@ class ExecResult:
             return f"(no output, rc={self.rc})"
         return "\n".join(parts)
 
+    def filtered_output(self) -> str:
+        """버그9: ros2 topic pub --rate/--times의 verbose 메시지 필터링.
+
+        'publishing #N: ...' 라인은 대부분 중복 노이즈.
+        첫 2줄만 남기고 나머지는 요약으로 대체.
+        다른 유용한 라인(data:, linear:, x:, ERPM 등)은 보존.
+        """
+        out = self.output()
+        lines = out.splitlines()
+
+        pub_lines = []
+        other_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("publishing #") or stripped.startswith("publisher:"):
+                pub_lines.append(line)
+            else:
+                other_lines.append(line)
+
+        if len(pub_lines) > 2:
+            # 첫 줄만 샘플로 남기고 요약
+            result_lines = other_lines + [
+                pub_lines[0],
+                f"... [{len(pub_lines)} publish messages total, showing first only] ...",
+            ]
+            return "\n".join(result_lines)
+
+        return out
+
     def to_tool_result(self, max_chars: int = 4000) -> str:
         status = "ok" if self.ok else f"error(rc={self.rc})"
-        out = self.output()
+        out = self.filtered_output()  # 버그9: verbose 필터 적용
         if len(out) > max_chars:
             head = out[:max_chars // 2]
             tail = out[-(max_chars // 4):]
@@ -108,10 +137,35 @@ class BoardConnection:
         except subprocess.TimeoutExpired:
             elapsed = int((time.monotonic() - t0) * 1000)
             self._consecutive_failures += 1
+            # 버그6: timeout 시 원격 고아 프로세스 정리
+            # SSH 세션은 이미 끊겼으므로 별도 연결로 cleanup
+            self._kill_remote_orphans(cmd)
             return ExecResult(ok=False, stdout="", stderr=f"timeout after {timeout}s", rc=-1, duration_ms=elapsed)
         except Exception as e:
             self._consecutive_failures += 1
             return ExecResult(ok=False, stdout="", stderr=str(e), rc=-1)
+
+    def _kill_remote_orphans(self, cmd: str) -> None:
+        """timeout된 SSH 명령의 원격 프로세스를 정리한다.
+
+        원격에서 실행 중인 _ecc_ 임시 스크립트와 ros2 pub 프로세스를
+        새 SSH 연결로 kill. 실패해도 조용히 무시 (best-effort).
+        """
+        try:
+            # /tmp/_ecc_* 스크립트와 자식 프로세스 정리
+            cleanup = (
+                "pkill -f '/tmp/_ecc_' 2>/dev/null; "
+                "pkill -f 'ros2 topic pub' 2>/dev/null; "
+                "rm -f /tmp/_ecc_* 2>/dev/null; "
+                "true"
+            )
+            kill_cmd = (
+                ["ssh"] + self.SSH_OPTS
+                + ["-p", str(self.port), f"{self.user}@{self.host}", cleanup]
+            )
+            subprocess.run(kill_cmd, capture_output=True, timeout=8)
+        except Exception:
+            pass  # cleanup 실패는 무시
 
     def upload_and_run(self, script: str, interpreter: str = "bash", timeout: int = 60) -> ExecResult:
         """스크립트를 base64 청크로 원격에 쓰고 실행한다. scp/ARG_MAX 문제 없음."""
@@ -125,18 +179,20 @@ class BoardConnection:
         CHUNK = 4000
         chunks = [b64[i:i+CHUNK] for i in range(0, len(b64), CHUNK)]
 
+        # 버그8: write timeout을 스크립트 크기에 비례해 자동 설정 (최소 30s)
+        write_timeout = max(30, len(chunks) * 5)
+
         if len(chunks) == 1:
             write_cmd = f"printf '%s' {chunks[0]} | base64 -d > {remote_path}"
-            r = self.run(write_cmd, timeout=30)
+            r = self.run(write_cmd, timeout=write_timeout)
         else:
-            # 첫 청크는 >, 이후는 >>
             lines = []
             for i, chunk in enumerate(chunks):
                 op = ">" if i == 0 else ">>"
                 lines.append(f"printf '%s' {chunk} | base64 -d {op} {remote_path}.b64")
             lines.append(f"base64 -d {remote_path}.b64 > {remote_path} && rm -f {remote_path}.b64")
             write_cmd = " && ".join(lines)
-            r = self.run(write_cmd, timeout=30)
+            r = self.run(write_cmd, timeout=write_timeout)
 
         if not r.ok:
             return ExecResult(ok=False, stdout="", stderr=f"script write failed (rc={r.rc}): {r.stderr}", rc=-1)
